@@ -30,6 +30,30 @@ freq_s = torch.fft.fftfreq(n_detectors, d=Delta_s)  # [513]
 
 
 class LearnableFBP(nn.Module):
+    """
+    Learnable Filtered Backprojection (FBP) pipeline.
+
+    Implements the classical FBP algorithm as a differentiable nn.Module,
+    making the filter and post-processing steps trainable end-to-end.
+
+    The forward pass follows the standard FBP steps:
+        1. FFT along the detector axis
+        2. Frequency-domain filtering (learnable filter * learnable window)
+        3. IFFT back to sinogram domain
+        4. Backprojection onto the image grid
+        5. Optional post-processing (e.g. UNet refinement)
+
+    Args:
+        filtering_module (nn.Module):   Applies filter and window in frequency domain.
+        backprojection_module (nn.Module): Differentiable backprojection (e.g. Vanilla_Backproj).
+        post_processing_module (nn.Module): Applied after backprojection (e.g. UNet, identity).
+
+    Input:
+        x (torch.Tensor): Sinogram batch of shape (B, 1, 1000, 513).
+
+    Output:
+        torch.Tensor: Reconstructed image batch of shape (B, 1, 362, 362).
+    """
     def __init__(self, filtering_module, backprojection_module, post_processing_module):
         super(LearnableFBP, self).__init__()
         self.filtering_module = filtering_module
@@ -56,10 +80,30 @@ class LearnableFBP(nn.Module):
 
 
 class Filtering_Module(nn.Module):
+    """
+    Frequency-domain filtering step of the FBP pipeline.
+
+    Applies a pointwise multiplication of the FFT-transformed sinogram with
+    a filter and a window, both of which can be learnable:
+
+        output = window(x) * filter(x) * x
+
+    Separating filter and window allows independent control over the
+    frequency shaping (filter) and the roll-off / apodization (window).
+
+    Args:
+        filter_model (nn.Module): Produces a frequency-domain filter (e.g. Ramp_Filter).
+        window_model (nn.Module): Produces an apodization window (e.g. LearnableWindow).
+
+    Input:
+        x (torch.Tensor): FFT of sinogram, shape (B, 1, 1000, 513), complex.
+
+    Output:
+        torch.Tensor: Filtered FFT, same shape as input.
+    """
     def __init__(self, filter_model, window_model):
         super(Filtering_Module, self).__init__()
         self.filter_model, self.window_model = filter_model, window_model
-
 
     def forward(self, x):
         filtering = self.filter_model(x)
@@ -69,10 +113,37 @@ class Filtering_Module(nn.Module):
 
 class Vanilla_Backproj(nn.Module):
     """
-    Backprojection module.
+    Differentiable backprojection module.
 
-    Performs differentiable filtered backprojection
-    using grid sampling and geometric projections.
+    Implements the backprojection step of FBP using PyTorch's grid_sample,
+    making it fully differentiable and GPU-compatible. All projection geometry
+    is precomputed in __init__ and stored as buffers (moved with the module
+    to the correct device automatically).
+
+    For each projection angle θ, every image pixel (x, y) is mapped to its
+    corresponding detector position via the dot product x·cos(θ) + y·sin(θ).
+    The sinogram value at that position is then interpolated (bilinear) and
+    accumulated across all angles — which is exactly the continuous backprojection
+    integral, discretized.
+
+    The geometry is hardcoded to the LoDoPaB-CT dataset:
+        - 1000 projection angles over [0, π]
+        - 513 detectors over [-0.13√2, +0.13√2] m
+        - Output cropped from 512×512 to 362×362 (center crop)
+        - Scaled by π / n_angles to approximate the continuous integral
+
+    Args:
+        n_angles (int):    Number of projection angles. Default: 1000.
+        n_detectors (int): Number of detector bins. Default: 513.
+        s_range (float):   Half-width of the detector in meters. Default: 0.13.
+        img_size (int):    Intermediate image size before cropping. Default: 512.
+        crop_size (int):   Final output image size. Default: 362.
+
+    Input:
+        x (torch.Tensor): Filtered sinogram, shape (B, 1, 1000, 513).
+
+    Output:
+        torch.Tensor: Reconstructed image, shape (B, 1, 362, 362).
     """
     def __init__(self, n_angles=n_angles, n_detectors=n_detectors, s_range=s_range, img_size=img_size, crop_size=crop_size):
         super(Vanilla_Backproj, self).__init__()
@@ -126,8 +197,7 @@ class Vanilla_Backproj(nn.Module):
         #  transpose for final orientation
         return torch.transpose(x, -1, -2)
 
-    @staticmethod
-    def _differentiable_center_crop(x, crop_size):
+    def _differentiable_center_crop(self, x, crop_size):
         """
         Applies a center crop on a 4D tensor in a differentiable manner.
 
@@ -145,6 +215,26 @@ class Vanilla_Backproj(nn.Module):
 
 
 class Ramp_Filter(nn.Module):
+    """
+    Classical ramp filter (Ram-Lak) for FBP.
+
+    Returns the absolute value of the frequency axis |ω|, which is the
+    theoretically correct filter for exact FBP reconstruction. Registered
+    as a buffer so it is automatically moved to the correct device.
+
+    This is the non-learnable baseline filter. It can be combined with a
+    learnable window in Filtering_Module to add trainable apodization on top.
+
+    Args:
+        freqs (torch.Tensor): Frequency axis, precomputed from detector spacing.
+            Default: module-level freq_s (shape [513]).
+
+    Input:
+        x: Ignored — the filter is independent of the input.
+
+    Output:
+        torch.Tensor: Ramp filter of shape (1, 1, 1, 513), broadcastable over (B, 1, n_angles, n_detectors).
+    """
     def __init__(self, freqs=freq_s):
         super().__init__()
         self.register_buffer('ramp', torch.abs(freqs))
@@ -154,6 +244,25 @@ class Ramp_Filter(nn.Module):
 
 #####
 class CompleteReconstruct(nn.Module):
+    """
+    Two-stage reconstruction pipeline: sinogram preprocessing + LearnableFBP.
+
+    Combines a sinogram-domain network with the full FBP reconstruction,
+    allowing the model to first clean or enhance the raw sinogram before
+    the reconstruction step. Used in experiments where sinogram-domain
+    processing is beneficial (e.g. noise reduction prior to backprojection).
+
+    Args:
+        learnablefbp (LearnableFBP):  The FBP reconstruction module.
+        preprocess_net (nn.Module):   Network applied to the sinogram before FBP
+                                      (e.g. UNet operating in sinogram domain).
+
+    Input:
+        X (torch.Tensor): Raw sinogram batch, shape (B, 1, 1000, 513).
+
+    Output:
+        torch.Tensor: Reconstructed image batch, shape (B, 1, 362, 362).
+    """
     def __init__(self, learnablefbp, preprocess_net):
         super(CompleteReconstruct, self).__init__()
         self.learnablefbp = learnablefbp

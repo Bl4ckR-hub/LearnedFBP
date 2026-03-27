@@ -3,6 +3,13 @@ import torch
 
 
 class Clamper(nn.Module):
+    """
+    Wraps torch.clamp as an nn.Module for use inside nn.Sequential pipelines.
+
+    Args:
+        min_val (float): Lower bound of the clamp range.
+        max_val (float): Upper bound of the clamp range.
+    """
     def __init__(self, min_val, max_val):
         super().__init__()
         self.min = min_val
@@ -11,6 +18,22 @@ class Clamper(nn.Module):
         return torch.clamp(x, self.min, self.max)
 
 class UNet_pre(nn.Module):
+    """
+    UNet for sinogram-domain preprocessing.
+
+    Structurally identical to UNet but with adjusted output_padding in the
+    bridge and decoder blocks to handle the non-square sinogram dimensions
+    (1000 x 513). The final activation is a Sigmoid, so outputs are in [0, 1].
+
+    Use this when the network operates on sinograms before reconstruction,
+    e.g. as the preprocess_net in CompleteReconstruct.
+
+    Args:
+        in_channels (int): Number of input/output channels (typically 1).
+
+    Input:  (B, in_channels, 1000, 513)
+    Output: (B, in_channels, 1000, 513)
+    """
     def __init__(self, in_channels):
         super().__init__()
         self.encoder_block1 = EncoderBlock(in_channels=in_channels, out_channels=64)
@@ -52,7 +75,22 @@ class UNet_pre(nn.Module):
 
         return self.sigmoid(X)
 
-class UNet(nn.Module):  # Input: [(Batch) x 1 X 362 X 362] -> [(Batch) x 1 x 362 x 362]
+class UNet(nn.Module):
+    """
+    Standard UNet for image-domain post-processing.
+
+    4-level encoder-decoder architecture with skip connections. Designed for
+    square image inputs (362 x 362). The final activation is a Sigmoid, so
+    outputs are in [0, 1] — suitable as the post_processing_module in LearnableFBP.
+
+    Channel progression: in → 64 → 128 → 256 → 512 → 1024 (bridge) → ... → in
+
+    Args:
+        in_channels (int): Number of input/output channels (typically 1).
+
+    Input:  (B, in_channels, 362, 362)
+    Output: (B, in_channels, 362, 362)
+    """
     def __init__(self, in_channels):
         super().__init__()
         self.encoder_block1 = EncoderBlock(in_channels=in_channels, out_channels=64)
@@ -94,6 +132,16 @@ class UNet(nn.Module):  # Input: [(Batch) x 1 X 362 X 362] -> [(Batch) x 1 x 362
         return self.sigmoid(X)
 
 class CNNBlock(nn.Module):
+    """
+    Basic convolutional building block: Conv → ReLU → Conv → ReLU.
+
+    Applies two 3x3 convolutions with same-padding (no spatial downsampling).
+    Used as the feature extraction unit inside EncoderBlock, DecoderBlock, and the bridge.
+
+    Args:
+        in_channels (int):  Number of input channels.
+        out_channels (int): Number of output channels.
+    """
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.layer = nn.Sequential(
@@ -108,6 +156,21 @@ class CNNBlock(nn.Module):
 
 
 class EncoderBlock(nn.Module):
+    """
+    UNet encoder step: CNNBlock followed by 2x2 MaxPooling.
+
+    Returns both the pre-pool feature map (for the skip connection) and
+    the pooled output (passed to the next encoder level).
+
+    Args:
+        in_channels (int):  Number of input channels.
+        out_channels (int): Number of output channels after convolution.
+
+    Returns:
+        tuple[Tensor, Tensor]: (skip, pooled)
+            - skip:   feature map before pooling, shape (B, out_channels, H, W)
+            - pooled: downsampled output,          shape (B, out_channels, H/2, W/2)
+    """
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.conv = CNNBlock(in_channels=in_channels, out_channels=out_channels)
@@ -120,6 +183,19 @@ class EncoderBlock(nn.Module):
 
 
 class DecoderBlock(nn.Module):
+    """
+    UNet decoder step: CNNBlock followed by transposed convolution (2x upsampling).
+
+    Receives the concatenation of the skip connection and the upsampled tensor
+    from the previous decoder level, processes it with a CNNBlock, then upsamples.
+
+    Args:
+        in_channels (int):   Number of input channels (skip + previous decoder output).
+        out_channels1 (int): Intermediate channels after CNNBlock.
+        out_channels2 (int): Output channels after upsampling.
+        output_padding (int or tuple): Passed to ConvTranspose2d to resolve spatial
+            size mismatches caused by odd input dimensions. Default: 0.
+    """
     def __init__(self, in_channels, out_channels1, out_channels2, output_padding=0):
         super().__init__()
         self.conv = CNNBlock(in_channels=in_channels, out_channels=out_channels1)
@@ -201,35 +277,6 @@ class LearnableWindowII(nn.Module):
         self.weights = nn.Parameter(init_tensor)
     def forward(self, x):
         return self.weights.unsqueeze(0).unsqueeze(0) # (1,1,1000,513)
-
-
-class PseudoResnet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv1 = CNNBlock(in_channels=1, out_channels=3)
-        self.conv2 = CNNBlock(in_channels=3, out_channels=9)
-        self.conv3 = CNNBlock(in_channels=9, out_channels=27)
-        self.conv4 = CNNBlock(in_channels=27, out_channels=81)
-        self.conv5 = CNNBlock(in_channels=81, out_channels=81)
-        self.conv6 = CNNBlock(in_channels=81, out_channels=27)
-        self.conv6 = CNNBlock(in_channels=27, out_channels=9)
-        self.conv7 = CNNBlock(in_channels=9, out_channels=3)
-        self.conv8 = CNNBlock(in_channels=3, out_channels=1)
-
-    def forward(self, X):
-        X1 = self.conv1(X)
-        X2 = self.conv2(X1)
-        X3 = self.conv3(X2)
-        X4 = self.conv4(X3)
-
-        X5 = self.conv5(X4)
-
-        X6 = self.conv6(X5 + X4)
-        X7 = self.conv7(X6 + X3)
-        X8 = self.conv8(X7 + X2)
-
-
-        return X8 + X1
     
 
 class UNet_no_activation(nn.Module):
