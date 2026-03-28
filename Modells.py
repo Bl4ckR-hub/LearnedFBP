@@ -230,9 +230,9 @@ class TrainableFourierSeries(nn.Module):
         self.const = torch.nn.Parameter(a_0, requires_grad=True)
 
     def forward(self, X):
-        filter = self.const + torch.matmul(self.cos_sin_stuff, self.coeffs)
-        filter = torch.fft.fftshift(filter)
-        return filter.unsqueeze(0).unsqueeze(0).unsqueeze(0) # (1,1,1,513)
+        filt = self.const + torch.matmul(self.cos_sin_stuff, self.coeffs)
+        filt = torch.fft.fftshift(filt)
+        return filt.unsqueeze(0).unsqueeze(0).unsqueeze(0) # (1,1,1,513)
 
     def cos_sin_coeffs(self, f, L):
         N = f.shape[0]
@@ -266,9 +266,9 @@ class TrainableFourierSeries(nn.Module):
 class LearnableWindow(nn.Module):
     def __init__(self, init_tensor=torch.ones(513)):
         super().__init__()
-        self.weights = nn.Parameter(init_tensor)  # or random init
+        self.weights = nn.Parameter(init_tensor) 
     def forward(self, x):
-        return self.weights.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+        return self.weights.unsqueeze(0).unsqueeze(0).unsqueeze(0) # (1, 1, 1, 513)
 ##############
 
 class LearnableWindowII(nn.Module):

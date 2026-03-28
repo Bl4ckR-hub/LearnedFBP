@@ -8,7 +8,7 @@ import torch
 import Trainer
 import piq
 import Modells
-import metrics
+import Metrics
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP

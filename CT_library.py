@@ -71,7 +71,6 @@ class LoDoPaB_Dataset(Dataset):
 
         >>> loader = torch.utils.data.DataLoader(dataset, batch_size=8, shuffle=True)
     """
-
     def __init__(self, sino_dir, gt_images_dir, transform=None, target_transform=None, suffix=None, amount_images=None):
         self.gt_image_names = sorted([x for x in os.listdir(gt_images_dir) if 'ground_truth' in x])
         self.sino_names = sorted([x for x in os.listdir(sino_dir) if 'observation' in x])

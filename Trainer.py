@@ -8,10 +8,37 @@ import torch.distributed as dist
 MAX = float("inf")
 
 
-
-
-
 class Trainer:
+    """
+    Manages distributed training and evaluation of a CT reconstruction model.
+
+    Training runs via PyTorch DistributedDataParallel (DDP). Each process owns
+    one `rank`; only rank 0 writes checkpoints and accumulates loss histories.
+
+    Supports an optional sinogram-domain auxiliary loss computed in Radon space,
+    two LR-scheduler modes (OneCycleLR per batch, ReduceLROnPlateau per epoch),
+    and periodic epoch-level checkpoint saves every 5 epochs.
+
+    Args:
+        model: DDP-wrapped model to train.
+        train_loader (DataLoader): DataLoader for training data.
+        valid_loader (DataLoader): DataLoader for validation data.
+        optim (Optimizer): PyTorch optimizer (e.g. Adam).
+        criterion: Primary loss function applied in image space (e.g. MSELoss).
+        criterion_sinogram (optional): Additional loss function applied in Radon
+            (sinogram) space. Set to None to disable.
+        best_model_checkpoint (str, optional): File path to save the best model
+            checkpoint whenever validation loss improves.
+        latest_model_checkpoint (str, optional): Reserved for future use.
+        lr_scheduler (optional): Learning-rate scheduler. Pass a OneCycleLR
+            instance together with ``one_cycle_lr=True``, or a
+            ReduceLROnPlateau instance otherwise.
+        rank: Device rank (GPU index or ``torch.device('cpu')``). Default: cpu.
+        one_cycle_lr (bool): If True, steps the scheduler after every batch
+            instead of after every epoch. Default: False.
+        training_results_dir (str, optional): Directory for periodic epoch
+            checkpoints saved every 5 epochs.
+    """
     def __init__(self, model, train_loader, valid_loader, optim, criterion, criterion_sinogram=None, best_model_checkpoint=None,
                  latest_model_checkpoint=None, lr_scheduler=None, rank=torch.device('cpu'), one_cycle_lr=False, training_results_dir=None):
         print("Initializing Variables")
@@ -43,6 +70,20 @@ class Trainer:
 
 
     def _run_train_batch(self, source, targets):
+        """
+        Performs a single training step on one batch.
+
+        Computes the combined image-space and optional sinogram-space loss,
+        runs backpropagation, and updates model weights. When ``one_cycle_lr``
+        is enabled the LR scheduler is stepped here after each batch.
+
+        Args:
+            source (Tensor): Input batch (e.g. filtered back-projection), shape (B, C, H, W).
+            targets (Tensor): Ground-truth batch, shape (B, C, H, W).
+
+        Returns:
+            float: Scalar total loss for this batch.
+        """
         self.optimizer.zero_grad()
         output = self.model(source)
         loss1 = self.criterion(output, targets)
@@ -64,6 +105,16 @@ class Trainer:
         return loss.item()
 
     def _run_valid_batch(self, source, targets):
+        """
+        Computes the loss for a single validation batch without gradient tracking.
+
+        Args:
+            source (Tensor): Input batch, shape (B, C, H, W).
+            targets (Tensor): Ground-truth batch, shape (B, C, H, W).
+
+        Returns:
+            float: Scalar total loss for this batch.
+        """
         output = self.model(source)
         loss1 = self.criterion(output, targets)
         loss2 = torch.tensor(0.0, device=self.rank)
@@ -76,7 +127,16 @@ class Trainer:
         return loss.item()
 
     def _run_train_epoch(self, epoch):
+        """
+        Runs one full training epoch over all batches.
 
+        Sets the model to train mode, iterates over the train loader, and
+        aggregates the per-batch losses across all DDP ranks via all_reduce.
+        Only rank 0 appends the averaged epoch loss to ``self.train_losses``.
+
+        Args:
+            epoch (int): Zero-based epoch index (used for logging and sampler).
+        """
         b_sz = len(next(iter(self.train_loader))[0])
         print(f"[GPU{self.rank}] Training | Epoch: {epoch + 1} | Batchsize: {b_sz} | Steps: {len(self.train_loader)}")
         running_loss = 0
@@ -97,7 +157,19 @@ class Trainer:
         print(f"[GPU{self.rank}] Training | Epoch: {epoch + 1} finished with loss: {epoch_loss}")
 
     def _run_valid_epoch(self, epoch):
-                
+        """
+        Runs one full validation epoch over all batches.
+
+        Sets the model to eval mode and disables gradient computation. Losses
+        are aggregated across DDP ranks via all_reduce. On rank 0, the epoch
+        loss is appended to ``self.val_losses`` and, if it is the best seen so
+        far, the model is saved to ``best_model_checkpoint``. For
+        ReduceLROnPlateau schedulers the step is called here with the epoch
+        loss; OneCycleLR is handled per-batch in ``_run_train_batch``.
+
+        Args:
+            epoch (int): Zero-based epoch index (used for logging).
+        """
         b_sz = len(next(iter(self.valid_loader))[0])
         print(f"[GPU{self.rank}] Validation | Epoch: {epoch + 1} | Batchsize: {b_sz} | Steps: {len(self.valid_loader)}")
         running_loss = 0
@@ -125,6 +197,15 @@ class Trainer:
         print(f"[GPU{self.rank}] Validation | Epoch: {epoch + 1} finished with loss: {epoch_loss}")
 
     def _save_checkpoint(self, checkpoint_dir):
+        """
+        Saves the model and optimizer state to disk.
+
+        If a file already exists at ``checkpoint_dir`` it is removed first so
+        that the file is always replaced atomically. Only call this from rank 0.
+
+        Args:
+            checkpoint_dir (str): Target file path for the checkpoint (.pth).
+        """
         checkpoint = {
             'model_state_dict': self.model.module.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -135,8 +216,22 @@ class Trainer:
         torch.save(checkpoint, checkpoint_dir)
 
     def train(self, max_epochs: int):
+        """
+        Runs the full training loop for up to ``max_epochs`` epochs.
+
+        On rank 0, a periodic checkpoint is saved every 5 epochs (starting
+        from epoch 5). Training can be stopped early by setting
+        ``self.stop_training = True`` from outside the loop.
+
+        Args:
+            max_epochs (int): Maximum number of epochs to train for.
+
+        Returns:
+            dict: ``{'train_losses': list, 'valid_losses': list}`` containing
+                the per-epoch losses collected on rank 0.
+        """
         for epoch in range(max_epochs):
-            
+
             ###
             if self.rank == 0:
                 if epoch > 0 and epoch % 5 == 0:
@@ -156,6 +251,16 @@ class Trainer:
         return {'train_losses': self.train_losses, 'valid_losses': self.val_losses}
 
     def evaluate(self):
+        """
+        Evaluates the model on the full validation set and stores per-sample metrics.
+
+        Runs inference without gradients, collects PSNR, L1, MSE, and SSIM for
+        every sample, then aggregates them across all DDP ranks via all_reduce.
+        Results are stored in ``self.metrics`` as a dict containing mean, best
+        (with index), and worst (with index) for each metric.
+
+        Note: SSIM is computed on clamped outputs in [0, 1].
+        """
         print(f"Entering Evaluation")
         self.model.eval()
 
@@ -196,13 +301,22 @@ class Trainer:
                         'worst_mse': (ls_mse.max(), ls_mse.argmax()), 'worst_ssim': (ls_ssim.min(), ls_ssim.argmin())}
 
     def _evaluator(self, pred, target):
+        """
+        Computes all four image quality metrics for a single batch.
 
+        SSIM is evaluated on outputs clamped to [0, 1] to match the expected
+        value range of the metric implementation.
+
+        Args:
+            pred (Tensor): Model output, shape (B, C, H, W).
+            target (Tensor): Ground-truth image, shape (B, C, H, W).
+
+        Returns:
+            tuple: (psnr, l1, mse, ssim) — one scalar tensor per metric.
+        """
         psnr = Metrics.psnr(pred, target)
         l1 = Metrics.l1_loss(pred, target)
         mse = Metrics.mse_loss(pred, target)
         ssim = Metrics.ssim_metric(torch.clamp(pred, 0, 1), torch.clamp(target, 0, 1))
 
         return psnr, l1, mse, ssim
-    
-
-
