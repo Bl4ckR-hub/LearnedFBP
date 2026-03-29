@@ -49,7 +49,7 @@ def main(rank, world_size):
     valid_sampler = torch.utils.data.distributed.DistributedSampler(
         valid_set, num_replicas=world_size, rank=rank
     )
-
+    # shuffle done by DS, pin_memory=True speeds up the transfer between CPU and GPU
     train_loader = DataLoader(dataset=train_set, batch_size=B, shuffle=False, pin_memory=True, sampler=train_sampler,
                               num_workers=2)
     valid_loader = DataLoader(dataset=valid_set, batch_size=B, shuffle=False, pin_memory=True, sampler=valid_sampler,
@@ -98,8 +98,6 @@ def main(rank, world_size):
                               latest_model_checkpoint=latest_model_checkpoint, lr_scheduler=scheduler, rank=rank,
                               one_cycle_lr=False, training_results_dir=training_results_dir)
 
-    # Testing
-    trainer.evaluate()
 
     losses = trainer.train(5)
     trainer.evaluate()

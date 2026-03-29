@@ -79,7 +79,7 @@ def main(rank, world_size):
     reconstructor = DDP(reconstructor, device_ids=[rank])
 
     optimizer = torch.optim.Adam(reconstructor.module.post_processing_module.parameters(), lr=1e-4)
-    l2_loss = torch.nn.MSELoss(reduction='sum')
+    l2_loss = torch.nn.MSELoss(reduction='mean')
     scheduler = ReduceLROnPlateau(optimizer=optimizer, factor=0.5, patience=1)
 
     trainer = Trainer.Trainer(model=reconstructor, train_loader=train_loader, valid_loader=valid_loader,
