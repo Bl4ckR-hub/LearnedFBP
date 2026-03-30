@@ -68,5 +68,4 @@ def ssim_metric(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     Returns:
         Scalar tensor with the batch-mean SSIM (in [0, 1], higher is better).
     """
-    ssim_per_sample = piq.ssim(pred, target, data_range=1.0, reduction='none')
-    return ssim_per_sample.mean()
+    return piq.ssim(pred, target, data_range=1.0, reduction='mean')

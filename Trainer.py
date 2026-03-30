@@ -57,14 +57,16 @@ class Trainer:
         self.model = model
         self.criterion = criterion
 
-        self.radon = CT_library.RadonTransform(rank).radon
+        self.radon = None
+        if criterion_sinogram is not None:
+            self.radon = CT_library.RadonTransform(rank).radon
+            
         print("Initing result arrays")
         self.train_losses = []
         self.val_losses = []
         self.metrics = []
 
         self.val_best = MAX
-        self.stop_training = False
         self.early_stopper_counter = 0
         print("Trainer init completed")
 
@@ -139,6 +141,7 @@ class Trainer:
         """
         b_sz = len(next(iter(self.train_loader))[0])
         print(f"[GPU{self.rank}] Training | Epoch: {epoch + 1} | Batchsize: {b_sz} | Steps: {len(self.train_loader)}")
+        
         running_loss = 0
         self.model.train()
         self.train_loader.sampler.set_epoch(epoch)
@@ -231,19 +234,6 @@ class Trainer:
                 the per-epoch losses collected on rank 0.
         """
         for epoch in range(max_epochs):
-
-            ###
-            if self.rank == 0:
-                if epoch > 0 and epoch % 5 == 0:
-                    dir_to_save = self.training_results_dir + f'checkpoint_epoch_{epoch}.pth'
-                    self._save_checkpoint(dir_to_save)
-            ###
-
-
-
-            if self.stop_training:
-                break
-
             print(f"Entering Epoch {epoch + 1}")
             self._run_train_epoch(epoch)
             self._run_valid_epoch(epoch)

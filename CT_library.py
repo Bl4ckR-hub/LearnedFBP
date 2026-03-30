@@ -102,13 +102,14 @@ class LoDoPaB_Dataset(Dataset):
 
         self.transform = transform
         self.target_transform = target_transform
-
+        
+        
     def __len__(self):
         return len(self.index_map)
 
     def __getitem__(self, idx):
         file_idx, data_idx = self.index_map[idx]
-
+        
         with h5py.File(self.sino_files[file_idx], 'r') as sino_file:
             sino = torch.from_numpy(sino_file['data'][data_idx])[None, :, :]
 
